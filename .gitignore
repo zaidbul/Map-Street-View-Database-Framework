@@ -1,0 +1,32 @@
+# Default ignored files
+/shelf/
+/workspace.xml
+# Editor-based HTTP Client requests
+/httpRequests/
+# Datasource local storage ignored files
+/dataSources/
+/dataSources.local.xml
+# Python
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.db
+*.log
+*.bak
+*.swp
+*.pth
+venv/
+
+# Node.js
+node_modules/
+dist/
+build/
+.next
+
+# Environment files
+.env
+.env
+
+# IDE files
+.vscode/
+.idea/
