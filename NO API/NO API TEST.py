@@ -24,7 +24,7 @@ LAT_MAX = 38.223611
 LON_MIN = -85.764151
 LON_MAX = -85.755796
 
-IMAGE_AMT = 5000               # total approximate points in the grid
+IMAGE_AMT = 4000               # total approximate points in the grid
 N_WORKERS = 6                # number of parallel scraping workers
 TIMEOUT = 5000
 RETRIES = 3
@@ -64,28 +64,57 @@ def get_pano_id_from_url(url):
 ###############################################################################
 # 2) ASYNC TILE DOWNLOAD + CV2 STITCH LOGIC (BATCHED)
 ###############################################################################
-async def fetch_tile(session, url):
+CONCURRENT_REQUESTS = 10
+semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
+
+async def fetch_tile(session, cbk0_url, panoid, fallback=False):
     """
-    Asynchronously fetch one tile's bytes. Returns None if status != 200.
+    Fetches a tile from cbk0 or falls back to googleusercontent.com for the full image if needed.
     """
-    try:
-        async with session.get(url) as response:
-            if response.status == 200:
-                return await response.read()
-            return None
-    except Exception as e:
-        print(f"Error fetching tile {url}: {e}")
+    async with semaphore:
+        for attempt in range(RETRIES):
+            try:
+                async with session.get(cbk0_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status == 200:
+                        return await response.read()
+                    elif response.status == 400 and not fallback:
+                        # Fall back to googleusercontent.com for the full image
+                        print(f"[Fallback] cbk0 failed with 400. Switching to googleusercontent for panoid {panoid}.")
+                        return await fetch_full_image(session, panoid)
+                    else:
+                        print(f"Tile fetch failed with status {response.status} on attempt {attempt + 1}.")
+            except Exception as e:
+                print(f"Error fetching tile {cbk0_url} on attempt {attempt + 1}: {e}")
+            await asyncio.sleep(2)
+        print(f"Failed to fetch tile {cbk0_url} after {RETRIES} attempts.")
         return None
 
-async def download_tiles_async(pano_id, zoom, max_x, max_y):
+async def fetch_full_image(session, panoid):
     """
-    Asynchronously download all tiles for (pano_id, zoom, 0..max_x-1, 0..max_y-1).
-    Returns a dict keyed by (x,y) => tile_bytes (or None for a tile failure).
-    Returns None if *all* tiles are None (completely failed).
+    Fetches the entire panorama image from googleusercontent.com for a given panoid.
+    """
+    fallback_url = f"https://lh3.googleusercontent.com/p/{panoid}=w13312-h6656"
+    try:
+        async with session.get(fallback_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            if response.status == 200:
+                print(f"[Fallback Success] Fetched full panorama for panoid {panoid}.")
+                return await response.read()
+            else:
+                print(f"[Fallback Failed] Status {response.status} for panoid {panoid}.")
+    except Exception as e:
+        print(f"[Fallback Error] Error fetching full panorama for panoid {panoid}: {e}")
+    return None
+
+
+
+
+async def download_tiles_async(panoid, zoom, max_x, max_y):
+    """
+    Downloads tiles for cbk0 and falls back to googleusercontent if necessary.
     """
     tile_url_template = (
         "https://cbk0.google.com/cbk?output=tile&panoid="
-        f"{pano_id}&zoom={zoom}&x={{x}}&y={{y}}"
+        f"{panoid}&zoom={zoom}&x={{x}}&y={{y}}"
     )
 
     tile_dict = {}
@@ -94,9 +123,9 @@ async def download_tiles_async(pano_id, zoom, max_x, max_y):
         coords_list = []
         for x in range(max_x):
             for y in range(max_y):
-                url = tile_url_template.format(x=x, y=y)
+                cbk0_url = tile_url_template.format(x=x, y=y)
                 coords_list.append((x, y))
-                tasks.append(fetch_tile(session, url))
+                tasks.append(fetch_tile(session, cbk0_url, panoid))
 
         # Gather all tile fetches in parallel
         results = await asyncio.gather(*tasks)
@@ -107,6 +136,7 @@ async def download_tiles_async(pano_id, zoom, max_x, max_y):
 
     # Check if all are None => total failure
     if all(v is None for v in tile_dict.values()):
+        print(f"[Tile Download Failure] All tiles failed for panoid {panoid} at zoom {zoom}.")
         return None
 
     return tile_dict
@@ -158,7 +188,7 @@ async def download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data):
     """
     Attempts multiple zoom levels. For each zoom candidate, batch-download tiles,
     stitch them, compute MD5, check duplicates, and return the saved filename if unique.
-    Otherwise, return None.
+    If all attempts fail, fallback to downloading the full panorama image.
     """
     zoom_candidates = [
         (5, 26, 13),
@@ -187,8 +217,6 @@ async def download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data):
         pano_md5 = compute_md5_for_stitched_image(stitched_result)
 
         # Check if we already have this MD5 in *this run or past runs*
-        # We'll check across all existing entries in pano_download_data
-        # (since we store "md5" in each record).
         if any(info.get("md5") == pano_md5 for info in pano_download_data.values()):
             print(f"[Dedup] Pano {pano_id} => MD5 {pano_md5} is a duplicate. Skipping.")
             return None
@@ -203,7 +231,22 @@ async def download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data):
         # Return the filename plus the MD5
         return (filename, pano_md5)
 
+    # Fallback to full panorama download if all zoom attempts fail
+    print(f"[Fallback] Tile downloads failed for panoid {pano_id}. Attempting full panorama.")
+    async with aiohttp.ClientSession() as session:
+        full_image = await fetch_full_image(session, pano_id)
+        if full_image:
+            pano_md5 = hashlib.md5(full_image).hexdigest()
+            filename = f"{lat:.5f}_{lon:.5f}_{pano_id}_full.jpg"
+            out_path = os.path.join(STITCH_DIR, filename)
+            with open(out_path, "wb") as f:
+                f.write(full_image)
+            print(f"[Full Image] Panorama saved: {out_path}")
+            return filename, pano_md5
+
+    print(f"[Failure] No panorama could be downloaded for panoid {pano_id}.")
     return None
+
 
 ###############################################################################
 # 3) GENERATE COORD GRID
