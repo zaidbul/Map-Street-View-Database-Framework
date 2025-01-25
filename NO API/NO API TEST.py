@@ -6,7 +6,7 @@ import io
 import requests
 import aiohttp
 import hashlib
-
+import torch
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -24,8 +24,8 @@ LAT_MAX = 38.223611
 LON_MIN = -85.764151
 LON_MAX = -85.755796
 
-IMAGE_AMT = 4000               # total approximate points in the grid
-N_WORKERS = 6                # number of parallel scraping workers
+IMAGE_AMT = 40               # total approximate points in the grid
+N_WORKERS = 8                # number of parallel scraping workers
 TIMEOUT = 5000
 RETRIES = 3
 
@@ -67,22 +67,27 @@ def get_pano_id_from_url(url):
 CONCURRENT_REQUESTS = 10
 semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
+# Global tracker for fallback attempts
+fallback_attempted = set()  # Global tracker
+
 async def fetch_tile(session, cbk0_url, panoid, fallback=False):
     """
     Fetches a tile from cbk0 or falls back to googleusercontent.com for the full image if needed.
     """
+    global fallback_attempted
     async with semaphore:
         for attempt in range(RETRIES):
             try:
                 async with session.get(cbk0_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
                     if response.status == 200:
                         return await response.read()
-                    elif response.status == 400 and not fallback:
+                    elif response.status == 400 and not fallback and panoid not in fallback_attempted:
                         # Fall back to googleusercontent.com for the full image
+                        fallback_attempted.add(panoid)
                         print(f"[Fallback] cbk0 failed with 400. Switching to googleusercontent for panoid {panoid}.")
-                        return await fetch_full_image(session, panoid)
-                    else:
-                        print(f"Tile fetch failed with status {response.status} on attempt {attempt + 1}.")
+                        full_image = await fetch_full_image(session, panoid)
+                        if full_image:
+                            return full_image  # Use the full image data
             except Exception as e:
                 print(f"Error fetching tile {cbk0_url} on attempt {attempt + 1}: {e}")
             await asyncio.sleep(2)
@@ -105,41 +110,93 @@ async def fetch_full_image(session, panoid):
         print(f"[Fallback Error] Error fetching full panorama for panoid {panoid}: {e}")
     return None
 
-
-
-
 async def download_tiles_async(panoid, zoom, max_x, max_y):
     """
-    Downloads tiles for cbk0 and falls back to googleusercontent if necessary.
+    Downloads tiles for cbk0, triggering fallback immediately if any tile fails.
+    If fallback succeeds, logs and exits without continuing tile-based downloads.
     """
     tile_url_template = (
         "https://cbk0.google.com/cbk?output=tile&panoid="
         f"{panoid}&zoom={zoom}&x={{x}}&y={{y}}"
     )
 
-    tile_dict = {}
     async with aiohttp.ClientSession() as session:
-        tasks = []
-        coords_list = []
+
+        # 1) Fetch the first tile synchronously
+        first_tile_url = tile_url_template.format(x=0, y=0)
+        print(f"[Tile Check] Trying first tile for panoid={panoid} at zoom={zoom}: {first_tile_url}")
+        first_tile_data = await fetch_tile(session, first_tile_url, panoid)
+
+        if first_tile_data is None:
+            # Trigger fallback immediately
+            print(f"[Zoom {zoom}] First tile failed for panoid={panoid}. Trying fallback.")
+            fallback_image = await fetch_full_image(session, panoid)
+            if fallback_image:
+                print(f"[Fallback Success] Full image fetched for panoid={panoid}.")
+                return {"full_image": fallback_image}
+            else:
+                print(f"[Zoom {zoom}] Fallback also failed for panoid={panoid}.")
+                return None
+
+        # 2) First tile succeeded => start downloading the rest
+        tile_dict = {(0, 0): first_tile_data}
         for x in range(max_x):
             for y in range(max_y):
-                cbk0_url = tile_url_template.format(x=x, y=y)
-                coords_list.append((x, y))
-                tasks.append(fetch_tile(session, cbk0_url, panoid))
+                # Skip (0,0) => already fetched
+                if x == 0 and y == 0:
+                    continue
 
-        # Gather all tile fetches in parallel
-        results = await asyncio.gather(*tasks)
+                tile_url = tile_url_template.format(x=x, y=y)
+                tile_data = await fetch_tile(session, tile_url, panoid)
 
-    # Store results in tile_dict
-    for (x, y), data in zip(coords_list, results):
-        tile_dict[(x, y)] = data
+                # Trigger fallback if any tile fails
+                if tile_data is None:
+                    print(f"[Zoom {zoom}] Tile ({x}, {y}) failed for panoid={panoid}. Triggering fallback.")
+                    fallback_image = await fetch_full_image(session, panoid)
+                    if fallback_image:
+                        print(f"[Fallback Success] Full image fetched for panoid={panoid} after tile failure.")
+                        return {"full_image": fallback_image}
+                    else:
+                        print(f"[Zoom {zoom}] Fallback also failed for panoid={panoid}.")
+                        return None
 
-    # Check if all are None => total failure
-    if all(v is None for v in tile_dict.values()):
-        print(f"[Tile Download Failure] All tiles failed for panoid {panoid} at zoom {zoom}.")
-        return None
+                # Add tile to the dictionary
+                tile_dict[(x, y)] = tile_data
 
     return tile_dict
+
+def stitch_tiles_gpu(tile_dict, max_x, max_y, tile_size=512):
+    """
+    Stitches tiles on GPU using PyTorch (if available), otherwise falls back to CPU.
+    """
+    if torch is None or not torch.cuda.is_available():
+        return stitch_tiles_cv2(tile_dict, max_x, max_y, tile_size)
+
+    pano_height = tile_size * max_y
+    pano_width = tile_size * max_x
+
+    # Create panorama tensor on GPU
+    panorama = torch.zeros((pano_height, pano_width, 3), dtype=torch.uint8, device='cuda')
+
+    for (x, y), tile_bytes in tile_dict.items():
+        if tile_bytes is not None:
+            try:
+                # Decode tile on CPU using OpenCV
+                arr = np.frombuffer(tile_bytes, np.uint8)
+                tile_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if tile_img is not None:
+                    # Move tile to GPU and copy into panorama
+                    tile_tensor = torch.from_numpy(tile_img).cuda()
+                    x_offset = x * tile_size
+                    y_offset = y * tile_size
+                    panorama[y_offset:y_offset + tile_img.shape[0],
+                    x_offset:x_offset + tile_img.shape[1], :] = tile_tensor
+            except Exception as e:
+                print(f"Error decoding/stitching tile ({x},{y}): {e}")
+
+    # Move panorama back to CPU and convert to NumPy
+    panorama_np = panorama.cpu().numpy()
+    return panorama_np
 
 def stitch_tiles_cv2(tile_dict, max_x, max_y, tile_size=512):
     """
@@ -184,11 +241,10 @@ def compute_md5_for_stitched_image(stitched_array):
     md5_hash = hashlib.md5(raw_bytes).hexdigest()
     return md5_hash
 
+
 async def download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data):
     """
-    Attempts multiple zoom levels. For each zoom candidate, batch-download tiles,
-    stitch them, compute MD5, check duplicates, and return the saved filename if unique.
-    If all attempts fail, fallback to downloading the full panorama image.
+    Handles fallback gracefully, ensuring no redundant tile downloads or stitching if fallback succeeds.
     """
     zoom_candidates = [
         (5, 26, 13),
@@ -198,53 +254,58 @@ async def download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data):
 
     for (zoom, max_x, max_y) in zoom_candidates:
         tile_dict = await download_tiles_async(pano_id, zoom, max_x, max_y)
+
         if tile_dict is None:
+            # First tile + fallback failed => try next zoom or mark invalid
             continue
 
+        # Handle fallback success
+        if "full_image" in tile_dict:
+            fallback_image = tile_dict["full_image"]
+            pano_md5 = hashlib.md5(fallback_image).hexdigest()
+
+            # Deduplicate and save
+            if any(info.get("md5") == pano_md5 for info in pano_download_data.values()):
+                print(f"[Dedup] Fallback image for panoid={pano_id} => MD5 {pano_md5} is a duplicate. Skipping.")
+                return None
+
+            filename = f"{lat:.5f}_{lon:.5f}_{pano_id}_full.jpg"
+            out_path = os.path.join(STITCH_DIR, filename)
+            with open(out_path, "wb") as f:
+                f.write(fallback_image)
+
+            print(f"[Fallback Saved] Panorama saved as fallback for panoid={pano_id}.")
+            return (filename, pano_md5)
+
+        # Otherwise stitch the tiles
         loop = asyncio.get_running_loop()
+
         def stitch_job():
-            return stitch_tiles_cv2(tile_dict, max_x, max_y, tile_size=512)
+            return stitch_tiles_gpu(tile_dict, max_x, max_y, tile_size=512)
 
         stitched_result = await loop.run_in_executor(stitch_executor, stitch_job)
         if stitched_result is None:
             continue
 
-        # Skip if it's basically an all-black image
         if np.count_nonzero(stitched_result) == 0:
             continue
 
-        # Compute MD5
+        # Compute MD5 and deduplicate
         pano_md5 = compute_md5_for_stitched_image(stitched_result)
-
-        # Check if we already have this MD5 in *this run or past runs*
         if any(info.get("md5") == pano_md5 for info in pano_download_data.values()):
-            print(f"[Dedup] Pano {pano_id} => MD5 {pano_md5} is a duplicate. Skipping.")
+            print(f"[Dedup] Stitched image for panoid={pano_id} => MD5 {pano_md5} is a duplicate. Skipping.")
             return None
 
-        # If not a duplicate, add to dictionary
+        # Save stitched panorama
         filename = f"{lat:.5f}_{lon:.5f}_{pano_id}.jpg"
         out_path = os.path.join(STITCH_DIR, filename)
         cv2.imwrite(out_path, stitched_result)
 
-        print(f"Stitched pano saved: {out_path}")
-
-        # Return the filename plus the MD5
+        print(f"[Stitched Saved] Panorama saved for panoid={pano_id}.")
         return (filename, pano_md5)
 
-    # Fallback to full panorama download if all zoom attempts fail
-    print(f"[Fallback] Tile downloads failed for panoid {pano_id}. Attempting full panorama.")
-    async with aiohttp.ClientSession() as session:
-        full_image = await fetch_full_image(session, pano_id)
-        if full_image:
-            pano_md5 = hashlib.md5(full_image).hexdigest()
-            filename = f"{lat:.5f}_{lon:.5f}_{pano_id}_full.jpg"
-            out_path = os.path.join(STITCH_DIR, filename)
-            with open(out_path, "wb") as f:
-                f.write(full_image)
-            print(f"[Full Image] Panorama saved: {out_path}")
-            return filename, pano_md5
-
-    print(f"[Failure] No panorama could be downloaded for panoid {pano_id}.")
+    # If all zooms + fallback fail
+    print(f"[Failure] No panorama could be downloaded for panoid={pano_id}.")
     return None
 
 
@@ -492,6 +553,7 @@ async def scraper_worker(
             save_panolog(PANOLOG, pano_log_data)
 
     print(f"Worker {worker_id} completed scraping.")
+    await page.close()
 
 ###############################################################################
 # MAIN
@@ -513,41 +575,80 @@ async def main():
             update_coverage(coverage, all_coords, lat, lon, rows, cols)
 
     # 4) Define grid layout
-    total_items = N_WORKERS + 1  # Add 1 for the graph
-    columns = 3  # Number of columns in the grid
-    grid_rows = (total_items + columns - 1) // columns  # Calculate rows to fit all items
-    window_width = 500
-    window_height = 500
+    total_items = N_WORKERS
+    grid_columns = 4  # Number of columns in the grid
+    window_width = 400
+    window_height = 400
+    overlap_x= int(0.3*window_width)
+    overlap_y=0
+
+    # Define graph window size and position
+    GRAPH_WIDTH = 700
+    GRAPH_HEIGHT = 700
+    GRAPH_X_OFFSET = 0  # Top-left corner (used when VIEW_TABS is False)
+    GRAPH_Y_OFFSET = 0
 
     # Start Playwright
     async with async_playwright() as pw:
         pages = []
 
-        for w_id in range(total_items):
-            # Calculate grid position
-            row = w_id // columns
-            col = w_id % columns
-            x_offset = col * window_width  # Horizontal position based on column
-            y_offset = row * window_height  # Vertical position based on row
+        for w_id in range(total_items+1):
+            # Calculate grid position for browsers
+            row = w_id // grid_columns
+            col = w_id % grid_columns
+            x_offset = col * (window_width-overlap_x)
+            y_offset = row * (window_height-overlap_y)
 
             if w_id < N_WORKERS:
                 # Worker browsers
-                browser = await pw.chromium.launch(
-                    headless=False,
-                    args=[
-                        f"--window-size={window_width},{window_height}",
-                        f"--window-position={x_offset},{y_offset}"
-                    ]
-                )
+                VIEW_TABS = True  # If set to True, you will see the browsers; otherwise, it will run in the background
+
+                if VIEW_TABS:  # If VIEW_TABS is True, launch visible browsers
+                    browser = await pw.chromium.launch(
+                        headless=False,
+                        args=[
+                            f"--window-size={window_width},{window_height}",
+                            f"--window-position={x_offset},{y_offset}"
+                        ]
+                    )
+                else:  # If VIEW_TABS is False, launch headless browsers
+                    browser = await pw.chromium.launch(
+                        headless=True,
+                        args=[
+                            f"--window-size={window_width},{window_height}"
+                        ]
+                    )
+
                 page = await browser.new_page()
                 await page.set_viewport_size({"width": window_width, "height": window_height})
                 pages.append(page)
+
             elif w_id == N_WORKERS:
                 # Graph window (use matplotlib interactive mode)
-                print(f"Positioning graph window at ({x_offset}, {y_offset})")
-                fig, ax = plt.subplots(figsize=(6, 6))  # Graph size (in inches)
+                if VIEW_TABS:
+                    # Position graph window in the grid with +150 offset
+                    if row >= 1:
+                        graph_x = (grid_columns*window_width)-((grid_columns-2)*overlap_x)
+                        graph_y = (y_offset // 2)-150
+                    else:
+                        graph_x = col * (window_width)
+                        graph_y = y_offset
+                    GRAPH_WIDTH = window_width+150
+                    GRAPH_HEIGHT = window_height+150
+                    print(f"Positioning graph window at ({graph_x}, {graph_y})")
+                else:
+                    # Position graph window at top-left corner
+                    graph_x = GRAPH_X_OFFSET
+                    graph_y = GRAPH_Y_OFFSET
+                    print(f"Positioning graph window at ({graph_x}, {graph_y})")
+
+                fig, ax = plt.subplots(figsize=(GRAPH_WIDTH / 100, GRAPH_HEIGHT / 100))  # Adjust size proportionally
                 draw_coverage(fig, ax, coverage)
-                plt.get_current_fig_manager().window.setGeometry(x_offset, y_offset, window_width, window_height)
+
+                # Position the graph window
+                plt.get_current_fig_manager().window.setGeometry(
+                    graph_x, graph_y, GRAPH_WIDTH, GRAPH_HEIGHT
+                )
                 plt.ion()  # Interactive mode for real-time updates
 
         # 5) Start scraping tasks
@@ -570,9 +671,11 @@ async def main():
             tasks.append(t)
 
         await asyncio.gather(*tasks)
+        print("All tasks completed.")  # Debug message
 
         # Final coverage draw
         draw_coverage(fig, ax, coverage)
+        print("Script completed successfully.")
         plt.ioff()
         plt.show()
 
