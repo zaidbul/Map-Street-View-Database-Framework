@@ -1,3 +1,10 @@
+'''
+This is for downloading images through googles API
+it will return PANO images.
+
+This code is not entirely up-to date for efficiency.
+'''
+
 import os
 import csv
 import re
