@@ -32,8 +32,10 @@ build/
 .next
 
 # Environment files
+USING API/.env
+USING API/.env
 .env
-.env
+
 
 # IDE files
 .vscode/

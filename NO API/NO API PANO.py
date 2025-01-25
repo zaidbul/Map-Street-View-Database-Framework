@@ -11,10 +11,12 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
+import contextily as ctx
 
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from playwright.async_api import async_playwright
+from pyproj import Transformer
 
 ###############################################################################
 # CONFIG / CONSTANTS
@@ -24,7 +26,7 @@ LAT_MAX = 38.223611
 LON_MIN = -85.764151
 LON_MAX = -85.755796
 
-IMAGE_AMT = 3500              # total approximate points in the grid
+IMAGE_AMT = 30              # total approximate points in the grid
 N_WORKERS = 8                # number of parallel scraping workers
 TIMEOUT = 5000
 RETRIES = 3
@@ -53,6 +55,15 @@ stitch_executor = ThreadPoolExecutor(max_workers=4)
 ###############################################################################
 # 1) UTILITY: EXTRACT PANO ID
 ###############################################################################
+wgs84_to_mercator = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+mercator_to_wgs84 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+
+def transform_bbox(lat_min, lat_max, lon_min, lon_max):
+    """Convert WGS84 coordinates to Web Mercator"""
+    x_min, y_min = wgs84_to_mercator.transform(lon_min, lat_min)
+    x_max, y_max = wgs84_to_mercator.transform(lon_max, lat_max)
+    return x_min, x_max, y_min, y_max
+
 def get_pano_id_from_url(url):
     """
     Example Street View URL might contain !1s{pano_id}!2...
@@ -241,10 +252,9 @@ def compute_md5_for_stitched_image(stitched_array):
     md5_hash = hashlib.md5(raw_bytes).hexdigest()
     return md5_hash
 
-
-async def download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data):
+async def download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data, coverage, coords, rows, cols, coverage_lock):
     """
-    Handles fallback gracefully, ensuring no redundant tile downloads or stitching if fallback succeeds.
+    Handles fallback gracefully and updates coverage for both tile-based and fallback downloads.
     """
     zoom_candidates = [
         (5, 26, 13),
@@ -275,6 +285,11 @@ async def download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data):
                 f.write(fallback_image)
 
             print(f"[Fallback Saved] Panorama saved as fallback for panoid={pano_id}.")
+
+            # Update coverage for fallback
+            async with coverage_lock:
+                update_coverage(coverage, coords, lat, lon, rows, cols)
+
             return (filename, pano_md5)
 
         # Otherwise stitch the tiles
@@ -283,7 +298,11 @@ async def download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data):
         def stitch_job():
             return stitch_tiles_gpu(tile_dict, max_x, max_y, tile_size=512)
 
-        stitched_result = await loop.run_in_executor(stitch_executor, stitch_job)
+        # Use tqdm to show progress for stitching
+        with tqdm(total=max_x * max_y, desc=f"Stitching {pano_id}") as pbar:
+            stitched_result = await loop.run_in_executor(stitch_executor, stitch_job)
+            pbar.update(max_x * max_y)  # Update progress bar to completion
+
         if stitched_result is None:
             continue
 
@@ -302,12 +321,16 @@ async def download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data):
         cv2.imwrite(out_path, stitched_result)
 
         print(f"[Stitched Saved] Panorama saved for panoid={pano_id}.")
+
+        # Update coverage for stitched panorama
+        async with coverage_lock:
+            update_coverage(coverage, coords, lat, lon, rows, cols)
+
         return (filename, pano_md5)
 
     # If all zooms + fallback fail
     print(f"[Failure] No panorama could be downloaded for panoid={pano_id}.")
     return None
-
 
 ###############################################################################
 # 3) GENERATE COORD GRID
@@ -319,8 +342,27 @@ def factor_rows_cols(total_points):
         cols += 1
     return rows, cols
 
+def calculate_grid_dimensions(lat_min, lat_max, lon_min, lon_max, total_points):
+    """Calculate rows/cols based on actual geographic aspect ratio"""
+    lat_range = lat_max - lat_min
+    lon_range = lon_max - lon_min
+    aspect_ratio = lon_range / lat_range
+
+    # Start with square-like grid
+    base = int(np.sqrt(total_points / aspect_ratio))
+    rows = int(base)
+    cols = int(base * aspect_ratio)
+
+    # Ensure we have enough points
+    while rows * cols < total_points:
+        cols += 1
+        if rows * cols < total_points:
+            rows += 1
+
+    return rows, cols
+
 def generate_coordinates(lat_min, lat_max, lon_min, lon_max, total_points):
-    rows, cols = factor_rows_cols(total_points)
+    rows, cols = calculate_grid_dimensions(lat_min, lat_max, lon_min, lon_max, total_points)
     lat_steps = np.linspace(lat_min, lat_max, rows)
     lon_steps = np.linspace(lon_min, lon_max, cols)
 
@@ -431,6 +473,102 @@ def draw_coverage(fig, ax, coverage):
     fig.canvas.draw()
     fig.canvas.flush_events()
 
+
+def init_map_with_coverage(lat_min, lat_max, lon_min, lon_max, rows, cols):
+    """Initialize map with correct projection and aspect ratio"""
+    # Convert coordinates to Web Mercator
+    x_min, x_max, y_min, y_max = transform_bbox(lat_min, lat_max, lon_min, lon_max)
+
+    # Calculate exact aspect ratio
+    width = x_max - x_min
+    height = y_max - y_min
+    aspect_ratio = width / height
+
+    # Create figure with dynamic size
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Set bounds and lock aspect ratio
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_aspect('equal', adjustable='datalim')
+
+    # Add basemap after setting aspect ratio
+    ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik, crs='EPSG:3857')
+
+    # Remove padding around the plot
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+    # Generate grid lines in WGS84 and transform to Mercator
+    lat_steps = np.linspace(lat_min, lat_max, rows + 1)
+    lon_steps = np.linspace(lon_min, lon_max, cols + 1)
+
+    # Draw latitude lines
+    for lat in lat_steps:
+        x_line = np.linspace(lon_min, lon_max, 100)
+        y_line = np.full_like(x_line, lat)
+        x_proj, y_proj = wgs84_to_mercator.transform(x_line, y_line)
+        ax.plot(x_proj, y_proj, color='gray', linestyle='--', linewidth=0.5, alpha=0.7)
+
+    # Draw longitude lines
+    for lon in lon_steps:
+        y_line = np.linspace(lat_min, lat_max, 100)
+        x_line = np.full_like(y_line, lon)
+        x_proj, y_proj = wgs84_to_mercator.transform(x_line, y_line)
+        ax.plot(x_proj, y_proj, color='gray', linestyle='--', linewidth=0.5, alpha=0.7)
+
+    ax.set_title("Live Coverage Map with Gridlines")
+    return fig, ax, np.zeros((rows, cols), dtype=int)
+
+def update_map_coverage(ax, coverage, lat_min, lat_max, lon_min, lon_max, rows, cols, r, c):
+    """
+    Update the map with the current coverage grid (PROPERLY PROJECTED)
+    Only updates the specific cell that changed.
+    """
+    # Clear previous coverage for this cell
+    for coll in ax.collections:
+        if coll.get_label() == f'coverage_cell_{r}_{c}':
+            coll.remove()
+
+    # Create grid steps in geographic coordinates
+    lon_steps = np.linspace(lon_min, lon_max, cols + 1)
+    lat_steps = np.linspace(lat_min, lat_max, rows + 1)
+
+    # Check if the cell is covered
+    if coverage[r, c] == 1:
+        # Get cell bounds in WGS84
+        left = lon_steps[c]
+        right = lon_steps[c + 1]
+        bottom = lat_steps[r]
+        top = lat_steps[r + 1]
+
+        # Transform to Mercator
+        x_left, y_bottom = wgs84_to_mercator.transform(left, bottom)
+        x_right, y_top = wgs84_to_mercator.transform(right, top)
+
+        # Create polygon coordinates
+        poly_coords = [
+            (x_left, y_bottom),
+            (x_right, y_bottom),
+            (x_right, y_top),
+            (x_left, y_top)
+        ]
+
+        # Add the polygon as a single collection
+        from matplotlib.collections import PolyCollection
+        coll = PolyCollection(
+            [poly_coords],
+            facecolors='red',
+            alpha=0.5,
+            edgecolors='none',
+            label=f'coverage_cell_{r}_{c}'
+        )
+        ax.add_collection(coll)
+
+    # Redraw with tight layout
+    plt.tight_layout()
+    plt.draw()
+    plt.pause(0.01)
+
 ###############################################################################
 # 6) FINAL CSV FROM PanoLog
 ###############################################################################
@@ -511,9 +649,15 @@ async def scraper_worker(
             pano_log_data[(lat, lon)] = {"pano_id": pano_id, "status": "Valid"}
             save_panolog(PANOLOG, pano_log_data)
 
+            # Get row and column indices for the updated cell
+            idx = coords.index((lat, lon))
+            r = idx // cols
+            c = idx % cols
+
+            # Update coverage for this cell
             async with coverage_lock:
                 update_coverage(coverage, coords, lat, lon, rows, cols)
-                draw_coverage(fig, ax, coverage)
+                update_map_coverage(ax, coverage, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX, rows, cols, r, c)
 
             # Check if we've already downloaded the file
             dl_entry = pano_download_data.get((lat, lon), {})
@@ -529,7 +673,7 @@ async def scraper_worker(
 
             # Download & stitch
             print(f"Worker {worker_id}: Downloading & Stitching => {pano_id} for {lat},{lon}")
-            result = await download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data)
+            result = await download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data, coverage, coords, rows, cols, coverage_lock)
             if result:
                 stitched_file, pano_md5 = result
                 pano_download_data[(lat, lon)] = {
@@ -559,125 +703,89 @@ async def scraper_worker(
 # MAIN
 ###############################################################################
 async def main():
-    # 1) Build coords
+    # Generate coordinates and initialize coverage
     all_coords, rows, cols = generate_coordinates(LAT_MIN, LAT_MAX, LON_MIN, LON_MAX, IMAGE_AMT)
     subsets = np.array_split(all_coords, N_WORKERS)
 
-    # 2) Load logs
+    # Initialize map with correct aspect ratio
+    fig, ax, coverage = init_map_with_coverage(LAT_MIN, LAT_MAX, LON_MIN, LON_MAX, rows, cols)
+    plt.show(block=False)
+
+    # Load existing logs
     pano_log_data = load_panolog(PANOLOG)
     pano_download_data = load_pano_downloadlog(PANODOWNLOAD_LOG)
 
-    # 3) coverage array
-    coverage = init_coverage(rows, cols)
-    # fill coverage from existing valid coords
-    for (lat, lon), info in pano_log_data.items():
-        if info["status"] == "Valid" and (lat, lon) in all_coords:
-            update_coverage(coverage, all_coords, lat, lon, rows, cols)
-
-    # 4) Define grid layout
-    total_items = N_WORKERS
-    grid_columns = 4  # Number of columns in the grid
-    window_width = 350
-    window_height = 350
-    overlap_x= int(0.3*window_width)
-    overlap_y=0
-
-    # Define graph window size and position
-    GRAPH_WIDTH = 700
-    GRAPH_HEIGHT = 700
-    GRAPH_X_OFFSET = 0  # Top-left corner (used when VIEW_TABS is False)
-    GRAPH_Y_OFFSET = 0
-
-    # Start Playwright
+    # Initialize browser windows with VIEW_TABS system
     async with async_playwright() as pw:
         pages = []
+        browsers = []
+        grid_columns = 4
+        window_width = 350
+        window_height = 350
+        overlap = 100  # Overlap between windows
 
-        for w_id in range(total_items+1):
-            # Calculate grid position for browsers
-            row = w_id // grid_columns
-            col = w_id % grid_columns
-            x_offset = col * (window_width-overlap_x)
-            y_offset = row * (window_height-overlap_y)
+        # Launch worker browsers
+        for w_id in range(N_WORKERS):
+            VIEW_TABS = True  # Set to True to see browsers
 
-            if w_id < N_WORKERS:
-                # Worker browsers
-                VIEW_TABS = True  # If set to True, you will see the browsers; otherwise, it will run in the background
-
-                if VIEW_TABS:  # If VIEW_TABS is True, launch visible browsers
-                    browser = await pw.chromium.launch(
-                        headless=False,
-                        args=[
-                            f"--window-size={window_width},{window_height}",
-                            f"--window-position={x_offset},{y_offset}"
-                        ]
-                    )
-                else:  # If VIEW_TABS is False, launch headless browsers
-                    browser = await pw.chromium.launch(
-                        headless=True,
-                        args=[
-                            f"--window-size={window_width},{window_height}"
-                        ]
-                    )
-
-                page = await browser.new_page()
-                await page.set_viewport_size({"width": window_width, "height": window_height})
-                pages.append(page)
-
-            elif w_id == N_WORKERS:
-                # Graph window (use matplotlib interactive mode)
-                if VIEW_TABS:
-                    # Position graph window in the grid with +150 offset
-                    if row >= 1:
-                        graph_x = (grid_columns*window_width)-((grid_columns-2)*overlap_x)
-                        graph_y = (y_offset // 2)
-                    else:
-                        graph_x = col * (window_width)
-                        graph_y = y_offset
-                    GRAPH_WIDTH = window_width+150
-                    GRAPH_HEIGHT = window_height+150
-                    print(f"Positioning graph window at ({graph_x}, {graph_y})")
-                else:
-                    # Position graph window at top-left corner
-                    graph_x = GRAPH_X_OFFSET
-                    graph_y = GRAPH_Y_OFFSET
-                    print(f"Positioning graph window at ({graph_x}, {graph_y})")
-
-                fig, ax = plt.subplots(figsize=(GRAPH_WIDTH / 100, GRAPH_HEIGHT / 100))  # Adjust size proportionally
-                draw_coverage(fig, ax, coverage)
-
-                # Position the graph window
-                plt.get_current_fig_manager().window.setGeometry(
-                    graph_x, graph_y, GRAPH_WIDTH, GRAPH_HEIGHT
+            if VIEW_TABS:
+                browser = await pw.chromium.launch(
+                    headless=False,
+                    args=[
+                        f"--window-size={window_width},{window_height}",
+                        f"--window-position={w_id % grid_columns * (window_width - overlap)},"
+                        f"{w_id // grid_columns * (window_height - overlap)}"
+                    ]
                 )
-                plt.ion()  # Interactive mode for real-time updates
+            else:
+                browser = await pw.chromium.launch(headless=True)
 
-        # 5) Start scraping tasks
+            page = await browser.new_page()
+            await page.set_viewport_size({"width": window_width, "height": window_height})
+            pages.append(page)
+            browsers.append(browser)
+
+        # Position the map window
+        if VIEW_TABS:
+            mgr = plt.get_current_fig_manager()
+            mgr.window.setGeometry(
+                grid_columns * (window_width - overlap) + 50,
+                50,
+                600,
+                int(600)
+            )
+
+        # Start scraping tasks
         tasks = []
+        coverage_lock = asyncio.Lock()
         for idx, subset in enumerate(subsets, start=1):
             t = asyncio.create_task(scraper_worker(
                 worker_id=idx,
                 coords_subset=subset,
                 coverage=coverage,
-                coverage_lock=asyncio.Lock(),
+                coverage_lock=coverage_lock,
                 coords=all_coords,
                 rows=rows,
                 cols=cols,
                 pano_log_data=pano_log_data,
                 pano_download_data=pano_download_data,
-                page=pages[idx - 1],  # Pass the corresponding page
+                page=pages[idx - 1],
                 fig=fig,
                 ax=ax
             ))
             tasks.append(t)
 
         await asyncio.gather(*tasks)
-        print("All tasks completed.")  # Debug message
 
-        # Final coverage draw
-        draw_coverage(fig, ax, coverage)
-        print("Script completed successfully.")
-        plt.ioff()
-        plt.show()
+        # Close browsers
+        for browser in browsers:
+            await browser.close()
+
+    # Final update and save
+    print("All Done!")
+    plt.ioff()
+    plt.show()
+    create_final_csv_from_panolog(pano_log_data, FINAL_CSV)
 
 if __name__ == "__main__":
     asyncio.run(main())
