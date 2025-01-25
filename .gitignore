@@ -6,6 +6,13 @@
 # Datasource local storage ignored files
 /dataSources/
 /dataSources.local.xml
+.gitignore
+Debug/
+# My ignores
+images/
+Panoramas/
+*.csv
+
 # Python
 __pycache__/
 *.py[cod]
