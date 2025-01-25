@@ -3,13 +3,14 @@ import csv
 import re
 import os
 import io
-import requests  # still used for page goto checks if needed, or you can remove if unneeded
+import requests
 import aiohttp
+import hashlib
 
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-import cv2  # now using cv2 instead of PIL
+import cv2
 
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
@@ -25,14 +26,17 @@ LON_MAX = -85.755796
 
 IMAGE_AMT = 5000               # total approximate points in the grid
 N_WORKERS = 6                # number of parallel scraping workers
-TIMEOUT = 4000
+TIMEOUT = 5000
 RETRIES = 3
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Where we store logs
 PANOLOG = os.path.join(SCRIPT_DIR, "PanoLog.csv")
+
+# We will store a new column "md5" here (we're no longer clearing this each run)
 PANODOWNLOAD_LOG = os.path.join(SCRIPT_DIR, "PanoDownload.csv")
+
 FINAL_CSV = os.path.join(SCRIPT_DIR, "FinalMetadata.csv")
 
 # Where we store stitched panos
@@ -43,17 +47,8 @@ os.makedirs(STITCH_DIR, exist_ok=True)
 matplotlib.use("Qt5Agg")
 plt.ion()  # interactive mode for coverage
 
-# Optional: Set up a ThreadPoolExecutor for parallel CPU stitching
-# Increase max_workers if you have more cores and want more concurrency.
+# ThreadPool for CPU-bound stitching so we don't block the event loop
 stitch_executor = ThreadPoolExecutor(max_workers=4)
-
-# If you have an OpenCV build with CUDA, you can attempt to enable it.
-# For example, you might do:
-# try:
-#     cv2.cuda.setDevice(0)
-#     print("CUDA setDevice(0) successful.")
-# except Exception as e:
-#     print(f"Warning: CUDA not available or error setting device: {e}")
 
 ###############################################################################
 # 1) UTILITY: EXTRACT PANO ID
@@ -85,7 +80,8 @@ async def fetch_tile(session, url):
 async def download_tiles_async(pano_id, zoom, max_x, max_y):
     """
     Asynchronously download all tiles for (pano_id, zoom, 0..max_x-1, 0..max_y-1).
-    Returns a dictionary keyed by (x,y) => tile_bytes or None if any tile fails.
+    Returns a dict keyed by (x,y) => tile_bytes (or None for a tile failure).
+    Returns None if *all* tiles are None (completely failed).
     """
     tile_url_template = (
         "https://cbk0.google.com/cbk?output=tile&panoid="
@@ -109,7 +105,7 @@ async def download_tiles_async(pano_id, zoom, max_x, max_y):
     for (x, y), data in zip(coords_list, results):
         tile_dict[(x, y)] = data
 
-    # Check if all None => means total failure
+    # Check if all are None => total failure
     if all(v is None for v in tile_dict.values()):
         return None
 
@@ -117,12 +113,11 @@ async def download_tiles_async(pano_id, zoom, max_x, max_y):
 
 def stitch_tiles_cv2(tile_dict, max_x, max_y, tile_size=512):
     """
-    Stitches all tile bytes in tile_dict into a single panorama using OpenCV (cv2).
+    Stitches tile bytes in tile_dict into a single panorama using OpenCV (cv2).
     tile_dict[(x,y)] = tile_bytes
 
-    Returns: a 3D NumPy array (H,W,3) or None if all tiles were invalid.
+    Returns: a 3D NumPy array (H,W,3) or None if all tiles are invalid.
     """
-    # If all are None, skip
     if not tile_dict or all(v is None for v in tile_dict.values()):
         return None
 
@@ -135,11 +130,9 @@ def stitch_tiles_cv2(tile_dict, max_x, max_y, tile_size=512):
     for (x, y), tile_bytes in tile_dict.items():
         if tile_bytes is not None:
             try:
-                # Decode bytes into an OpenCV image
                 arr = np.frombuffer(tile_bytes, np.uint8)
                 tile_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # shape (h, w, 3)
                 if tile_img is not None:
-                    # Place tile into the correct spot
                     x_offset = x * tile_size
                     y_offset = y * tile_size
                     panorama[y_offset:y_offset+tile_img.shape[0],
@@ -149,11 +142,23 @@ def stitch_tiles_cv2(tile_dict, max_x, max_y, tile_size=512):
 
     return panorama
 
-async def download_and_stitch_pano_cv2(lat, lon, pano_id):
+###############################################################################
+# 2B) MD5 HASHING FOR FINAL PANORAMA
+###############################################################################
+def compute_md5_for_stitched_image(stitched_array):
     """
-    Attempts multiple zoom levels. For each zoom candidate, batch-download
-    tiles in parallel (async), then stitch them in a background thread with cv2.
-    Returns the output filename if successful, else None.
+    stitched_array: NumPy array of shape (height, width, 3).
+    Returns an MD5 hex string for the raw bytes.
+    """
+    raw_bytes = stitched_array.tobytes()
+    md5_hash = hashlib.md5(raw_bytes).hexdigest()
+    return md5_hash
+
+async def download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data):
+    """
+    Attempts multiple zoom levels. For each zoom candidate, batch-download tiles,
+    stitch them, compute MD5, check duplicates, and return the saved filename if unique.
+    Otherwise, return None.
     """
     zoom_candidates = [
         (5, 26, 13),
@@ -162,12 +167,10 @@ async def download_and_stitch_pano_cv2(lat, lon, pano_id):
     ]
 
     for (zoom, max_x, max_y) in zoom_candidates:
-        # 1) Download all tiles asynchronously
         tile_dict = await download_tiles_async(pano_id, zoom, max_x, max_y)
         if tile_dict is None:
-            continue  # means we got all None tiles => try next zoom
+            continue
 
-        # 2) Run stitching in a thread pool (to avoid blocking event loop)
         loop = asyncio.get_running_loop()
         def stitch_job():
             return stitch_tiles_cv2(tile_dict, max_x, max_y, tile_size=512)
@@ -176,20 +179,30 @@ async def download_and_stitch_pano_cv2(lat, lon, pano_id):
         if stitched_result is None:
             continue
 
-        # 3) If we have a non-empty result, save it
+        # Skip if it's basically an all-black image
         if np.count_nonzero(stitched_result) == 0:
-            # Means likely all black => invalid
             continue
 
+        # Compute MD5
+        pano_md5 = compute_md5_for_stitched_image(stitched_result)
+
+        # Check if we already have this MD5 in *this run or past runs*
+        # We'll check across all existing entries in pano_download_data
+        # (since we store "md5" in each record).
+        if any(info.get("md5") == pano_md5 for info in pano_download_data.values()):
+            print(f"[Dedup] Pano {pano_id} => MD5 {pano_md5} is a duplicate. Skipping.")
+            return None
+
+        # If not a duplicate, add to dictionary
         filename = f"{lat:.5f}_{lon:.5f}_{pano_id}.jpg"
         out_path = os.path.join(STITCH_DIR, filename)
-
-        # Save with cv2
         cv2.imwrite(out_path, stitched_result)
-        print(f"Stitched pano saved: {out_path}")
-        return filename
 
-    # If we exhaust all zooms with no success, return None
+        print(f"Stitched pano saved: {out_path}")
+
+        # Return the filename plus the MD5
+        return (filename, pano_md5)
+
     return None
 
 ###############################################################################
@@ -214,7 +227,7 @@ def generate_coordinates(lat_min, lat_max, lon_min, lon_max, total_points):
     return coords, rows, cols
 
 ###############################################################################
-# 4) CSV LOGS: PanoLog, PanoDownload
+# 4) CSV LOGS: PanoLog, PanoDownload (with new "md5" column)
 ###############################################################################
 def load_panolog(csv_path):
     """
@@ -247,7 +260,8 @@ def save_panolog(csv_path, data_dict):
 
 def load_pano_downloadlog(csv_path):
     """
-    { (lat, lon): {'pano_id':'', 'filename':'', 'status':'Downloaded'/'Failed' etc.} }
+    Returns: { (lat, lon): {'pano_id':'', 'filename':'', 'status':'', 'md5':''} }
+    Gracefully handles older CSVs missing 'md5' by setting it to ''.
     """
     data = {}
     if os.path.isfile(csv_path):
@@ -258,12 +272,22 @@ def load_pano_downloadlog(csv_path):
                 data[key] = {
                     "pano_id": row["pano_id"],
                     "filename": row["filename"],
-                    "status": row["status"]
+                    "status": row["status"],
+                    # Use row.get(...) to avoid KeyError if 'md5' column is missing
+                    "md5": row.get("md5", "")
                 }
     return data
 
 def save_pano_downloadlog(csv_path, data_dict):
-    fieldnames = ["latitude", "longitude", "pano_id", "filename", "status"]
+    """
+    data_dict[(lat, lon)] = {
+        "pano_id": pano_id,
+        "filename": stitched_file,
+        "status": "Downloaded" or "Failed",
+        "md5": string
+    }
+    """
+    fieldnames = ["latitude", "longitude", "pano_id", "filename", "status", "md5"]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -273,7 +297,8 @@ def save_pano_downloadlog(csv_path, data_dict):
                 "longitude": lon,
                 "pano_id": info["pano_id"],
                 "filename": info["filename"],
-                "status": info["status"]
+                "status": info["status"],
+                "md5": info.get("md5", "")
             })
 
 ###############################################################################
@@ -357,7 +382,6 @@ async def scraper_worker(
         # Check PanoLog => skip if status=Valid
         existing_log = pano_log_data.get((lat, lon), {})
         if existing_log.get("status") == "Valid":
-            # Might also want to check PanoDownload if physically downloaded
             dl_info = pano_download_data.get((lat, lon), {})
             if dl_info.get("status") == "Downloaded":
                 print(f"Worker {worker_id}: Skipping {lat},{lon} (Already valid/downloaded)")
@@ -371,7 +395,6 @@ async def scraper_worker(
         except Exception as e:
             print(f"Worker {worker_id}: Navigation fail at {lat},{lon}: {e}")
             pano_log_data[(lat, lon)] = {"pano_id": "", "status": "Invalid"}
-            # Immediately save the updated log
             save_panolog(PANOLOG, pano_log_data)
             continue
 
@@ -382,11 +405,8 @@ async def scraper_worker(
         if pano_id:
             # Mark coverage=valid
             pano_log_data[(lat, lon)] = {"pano_id": pano_id, "status": "Valid"}
-
-            # Immediately save updated PanoLog so we don't lose it
             save_panolog(PANOLOG, pano_log_data)
 
-            # Update coverage array in a lock
             async with coverage_lock:
                 update_coverage(coverage, coords, lat, lon, rows, cols)
                 draw_coverage(fig, ax, coverage)
@@ -394,7 +414,6 @@ async def scraper_worker(
             # Check if we've already downloaded the file
             dl_entry = pano_download_data.get((lat, lon), {})
             if dl_entry.get("status") == "Downloaded":
-                # physically exist?
                 existing_file = dl_entry.get("filename", "")
                 if existing_file:
                     pathcheck = os.path.join(STITCH_DIR, existing_file)
@@ -404,28 +423,28 @@ async def scraper_worker(
                     else:
                         print(f"Worker {worker_id}: Missing physical => re-download {existing_file}")
 
-            # Download & stitch async
+            # Download & stitch
             print(f"Worker {worker_id}: Downloading & Stitching => {pano_id} for {lat},{lon}")
-            stitched_file = await download_and_stitch_pano_cv2(lat, lon, pano_id)
-
-            if stitched_file:
+            result = await download_and_stitch_pano_cv2(lat, lon, pano_id, pano_download_data)
+            if result:
+                stitched_file, pano_md5 = result
                 pano_download_data[(lat, lon)] = {
                     "pano_id": pano_id,
                     "filename": stitched_file,
-                    "status": "Downloaded"
+                    "status": "Downloaded",
+                    "md5": pano_md5
                 }
             else:
                 pano_download_data[(lat, lon)] = {
                     "pano_id": pano_id,
                     "filename": "",
-                    "status": "Failed"
+                    "status": "Failed",
+                    "md5": ""
                 }
 
-            # Immediately save the updated download log
             save_pano_downloadlog(PANODOWNLOAD_LOG, pano_download_data)
 
         else:
-            # Mark invalid
             pano_log_data[(lat, lon)] = {"pano_id": "", "status": "Invalid"}
             save_panolog(PANOLOG, pano_log_data)
 
@@ -450,47 +469,73 @@ async def main():
         if info["status"] == "Valid" and (lat, lon) in all_coords:
             update_coverage(coverage, all_coords, lat, lon, rows, cols)
 
-    fig, ax = plt.subplots(figsize=(8, 8))
-    draw_coverage(fig, ax, coverage)
-    coverage_lock = asyncio.Lock()
+    # 4) Define grid layout
+    total_items = N_WORKERS + 1  # Add 1 for the graph
+    columns = 3  # Number of columns in the grid
+    grid_rows = (total_items + columns - 1) // columns  # Calculate rows to fit all items
+    window_width = 500
+    window_height = 500
 
-    # 4) Start workers (Playwright)
+    # Start Playwright
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
         pages = []
-        for w_id in range(N_WORKERS):
-            p = await browser.new_page()
-            pages.append(p)
 
+        for w_id in range(total_items):
+            # Calculate grid position
+            row = w_id // columns
+            col = w_id % columns
+            x_offset = col * window_width  # Horizontal position based on column
+            y_offset = row * window_height  # Vertical position based on row
+
+            if w_id < N_WORKERS:
+                # Worker browsers
+                browser = await pw.chromium.launch(
+                    headless=False,
+                    args=[
+                        f"--window-size={window_width},{window_height}",
+                        f"--window-position={x_offset},{y_offset}"
+                    ]
+                )
+                page = await browser.new_page()
+                await page.set_viewport_size({"width": window_width, "height": window_height})
+                pages.append(page)
+            elif w_id == N_WORKERS:
+                # Graph window (use matplotlib interactive mode)
+                print(f"Positioning graph window at ({x_offset}, {y_offset})")
+                fig, ax = plt.subplots(figsize=(6, 6))  # Graph size (in inches)
+                draw_coverage(fig, ax, coverage)
+                plt.get_current_fig_manager().window.setGeometry(x_offset, y_offset, window_width, window_height)
+                plt.ion()  # Interactive mode for real-time updates
+
+        # 5) Start scraping tasks
         tasks = []
         for idx, subset in enumerate(subsets, start=1):
             t = asyncio.create_task(scraper_worker(
                 worker_id=idx,
                 coords_subset=subset,
                 coverage=coverage,
-                coverage_lock=coverage_lock,
+                coverage_lock=asyncio.Lock(),
                 coords=all_coords,
                 rows=rows,
                 cols=cols,
                 pano_log_data=pano_log_data,
                 pano_download_data=pano_download_data,
-                page=pages[idx-1],
+                page=pages[idx - 1],  # Pass the corresponding page
                 fig=fig,
                 ax=ax
             ))
             tasks.append(t)
 
         await asyncio.gather(*tasks)
-        await browser.close()
 
-    # 5) Final coverage draw
-    draw_coverage(fig, ax, coverage)
-
-    # 6) Build final CSV from PanoLog (once at end, summarizing everything)
-    create_final_csv_from_panolog(pano_log_data, FINAL_CSV)
-
-    plt.ioff()
-    plt.show()
+        # Final coverage draw
+        draw_coverage(fig, ax, coverage)
+        plt.ioff()
+        plt.show()
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+
