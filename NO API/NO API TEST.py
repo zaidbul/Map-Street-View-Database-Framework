@@ -24,7 +24,7 @@ LAT_MAX = 38.223611
 LON_MIN = -85.764151
 LON_MAX = -85.755796
 
-IMAGE_AMT = 40               # total approximate points in the grid
+IMAGE_AMT = 3500              # total approximate points in the grid
 N_WORKERS = 8                # number of parallel scraping workers
 TIMEOUT = 5000
 RETRIES = 3
@@ -577,8 +577,8 @@ async def main():
     # 4) Define grid layout
     total_items = N_WORKERS
     grid_columns = 4  # Number of columns in the grid
-    window_width = 400
-    window_height = 400
+    window_width = 350
+    window_height = 350
     overlap_x= int(0.3*window_width)
     overlap_y=0
 
@@ -629,7 +629,7 @@ async def main():
                     # Position graph window in the grid with +150 offset
                     if row >= 1:
                         graph_x = (grid_columns*window_width)-((grid_columns-2)*overlap_x)
-                        graph_y = (y_offset // 2)-150
+                        graph_y = (y_offset // 2)
                     else:
                         graph_x = col * (window_width)
                         graph_y = y_offset
