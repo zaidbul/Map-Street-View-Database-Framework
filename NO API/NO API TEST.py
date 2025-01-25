@@ -2,10 +2,10 @@ import asyncio
 import csv
 import re
 import os
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 from playwright.async_api import async_playwright
-from PIL import Image
 
 ###############################################################################
 # CONFIGURATION
@@ -14,42 +14,66 @@ LAT_MIN = 38.210786
 LAT_MAX = 38.223611
 LON_MIN = -85.764151
 LON_MAX = -85.755796
-IMAGE_AMT = 10  # Number of points to generate in the grid
+
+IMAGE_AMT = 2500  # total approximate points in the grid
+N_WORKERS = 4     # number of parallel tasks
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-IMAGE_DIR = os.path.join(SCRIPT_DIR, "Panoramas")
-os.makedirs(IMAGE_DIR, exist_ok=True)
 DEBUG_DIR = os.path.join(SCRIPT_DIR, "Debug")
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
 PANOLOG = os.path.join(SCRIPT_DIR, "PanoLog.csv")
+FINAL_CSV = os.path.join(SCRIPT_DIR, "FinalMetadata.csv")
 
-TIMEOUT = 60000  # Timeout in milliseconds
-RETRIES = 3  # Number of retries for navigation
+TIMEOUT = 4000
+RETRIES = 3
+FALLBACK_RETRIES = 2
+
+# If PyCharm or your environment doesn’t show a window by default
+matplotlib.use("Qt5Agg")
+plt.ion()  # interactive mode for live updates
 
 ###############################################################################
 # UTILITY FUNCTIONS
 ###############################################################################
 def get_pano_id_from_url(url):
-    """Extract pano ID from a Street View URL."""
-    match = re.search(r'!1s([^!]+)!', url)
+    """Extract the pano_id from final Street View URL."""
+    match = re.search(r'!1s([^!]+)!2', url)
     return match.group(1) if match else None
 
+def factor_rows_cols(total_points):
+    rows = int(np.sqrt(total_points))
+    cols = rows
+    while rows * cols < total_points:
+        cols += 1
+    return rows, cols
+
 def generate_coordinates(lat_min, lat_max, lon_min, lon_max, total_points):
-    """Generate a grid of lat/lon coordinates."""
-    area = (lat_max - lat_min) * (lon_max - lon_min)
-    step = (area / total_points) ** 0.5
-    latitudes = np.arange(lat_min, lat_max, step)
-    longitudes = np.arange(lon_min, lon_max, step)
+    """Create a grid of lat/lon in row-major order."""
+    rows, cols = factor_rows_cols(total_points)
+    lat_steps = np.linspace(lat_min, lat_max, rows)
+    lon_steps = np.linspace(lon_min, lon_max, cols)
 
     coords = []
-    for lat in latitudes:
-        for lon in longitudes:
+    for lat in lat_steps:
+        for lon in lon_steps:
             coords.append((round(lat, 5), round(lon, 5)))
-    return coords
+    return coords, rows, cols
+
+def split_coords_among_workers(coords, n):
+    """Split the coordinate list into n sublists, each ~equal in size."""
+    chunk_size = len(coords) // n
+    subsets = []
+    start = 0
+    for i in range(n):
+        end = start + chunk_size
+        if i == n - 1:
+            end = len(coords)  # last chunk picks up remainder
+        subsets.append(coords[start:end])
+        start = end
+    return subsets
 
 async def safe_goto(page, url, retries, timeout):
-    """Navigate to a URL with retries."""
     for attempt in range(retries):
         try:
             print(f"Attempting to navigate (attempt {attempt + 1}): {url}")
@@ -61,30 +85,29 @@ async def safe_goto(page, url, retries, timeout):
                 return False
 
 async def scrape_pano_id(page, lat, lon):
-    """Scrape pano ID from Street View."""
     url = f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat},{lon}"
-    success = await safe_goto(page, url, retries=RETRIES, timeout=TIMEOUT)
-
+    print(f"scrape_pano_id - desired URL: {url}")
+    success = await safe_goto(page, url, RETRIES, TIMEOUT)
     if not success:
-        print(f"Failed to load URL: {url}")
+        print("safe_goto => false, no success")
         return None, None
 
-    # Take a debug screenshot
-    debug_path = os.path.join(DEBUG_DIR, f"debug_{lat}_{lon}.png")
-    await page.screenshot(path=debug_path)
+    print(f"scrape_pano_id - arrived URL: {page.url}")
+    await page.wait_for_timeout(2000)
+    final_url = page.url
+    print(f"scrape_pano_id - final URL after wait: {final_url}")
 
-    # Extract pano ID from the URL
-    pano_id = get_pano_id_from_url(page.url)
-    return pano_id, page.url
+    pano_id = get_pano_id_from_url(final_url)
+    print(f"scrape_pano_id - extracted pano_id: {pano_id}")
+    return pano_id, final_url
 
 ###############################################################################
-# PANOLOG CSV HELPERS
+# PANOLOG CSV
 ###############################################################################
 def load_panolog(csv_path):
-    """Load existing pano data from CSV."""
     data = {}
     if os.path.isfile(csv_path):
-        with open(csv_path, mode="r", newline="", encoding="utf-8") as f:
+        with open(csv_path, "r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 lat, lon = float(row["latitude"]), float(row["longitude"])
@@ -95,84 +118,183 @@ def load_panolog(csv_path):
     return data
 
 def save_panolog(csv_path, data_dict):
-    """Save updated pano data to CSV."""
     fieldnames = ["latitude", "longitude", "pano_id", "status"]
-    with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for (lat, lon), info in data_dict.items():
-            writer.writerow({"latitude": lat, "longitude": lon, "pano_id": info["pano_id"], "status": info["status"]})
+            writer.writerow({
+                "latitude": lat,
+                "longitude": lon,
+                "pano_id": info["pano_id"],
+                "status": info["status"]
+            })
 
 ###############################################################################
-# LIVE PROGRESS GRID
+# COVERAGE & PLOTTING
 ###############################################################################
-def draw_progress_grid(coords, panolog_data, lat_min, lat_max, lon_min, lon_max):
-    """Draw a live progress grid."""
-    grid_size = int(len(coords) ** 0.5)
-    grid = np.zeros((grid_size, grid_size), dtype=int)
+def init_coverage(rows, cols):
+    return np.zeros((rows, cols), dtype=int)
 
-    lat_steps = np.linspace(lat_min, lat_max, grid_size + 1)
-    lon_steps = np.linspace(lon_min, lon_max, grid_size + 1)
+def update_coverage_in_array(coverage, rows, cols, coords, lat, lon):
+    """Just sets coverage[r,c] = 1 for the coordinate."""
+    idx = coords.index((lat, lon))
+    r = idx // cols
+    c = idx % cols
+    coverage[r, c] = 1
 
-    for (lat, lon) in coords:
-        lat_idx = np.searchsorted(lat_steps, lat) - 1
-        lon_idx = np.searchsorted(lon_steps, lon) - 1
+def draw_progress_grid(fig, ax, coverage):
+    ax.clear()
+    cax = ax.imshow(coverage, cmap="gray_r", origin="upper", vmin=0, vmax=1)
+    ax.set_title("Grid Coverage Progress (0=white, 1=black)")
+    ax.grid(color="black", linewidth=0.5)
+
+    if not hasattr(draw_progress_grid, "cbar"):
+        draw_progress_grid.cbar = fig.colorbar(cax, ax=ax)
+    else:
+        draw_progress_grid.cbar.update_normal(cax)
+
+    fig.canvas.draw()
+    fig.canvas.flush_events()
+
+###############################################################################
+# Shared update coverage + plot function
+###############################################################################
+async def update_coverage_and_plot(coverage_lock, coverage, rows, cols, coords,
+                                   lat, lon, fig, ax):
+    """
+    Lock-protected coverage update + coverage redraw.
+    So multiple workers won't try to draw coverage at once.
+    """
+    async with coverage_lock:
+        # 1) Update coverage array
+        update_coverage_in_array(coverage, rows, cols, coords, lat, lon)
+        # 2) Redraw coverage
+        draw_progress_grid(fig, ax, coverage)
+
+###############################################################################
+# FINAL CSV
+###############################################################################
+def create_final_csv_from_panolog(panolog_data, output_csv):
+    fieldnames = ["latitude", "longitude", "pano_id", "status"]
+    rows = []
+    for (lat, lon), info in panolog_data.items():
+        rows.append({
+            "latitude": lat,
+            "longitude": lon,
+            "pano_id": info["pano_id"],
+            "status": info["status"],
+        })
+
+    with open(output_csv, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    print(f"\nFinal CSV created: {output_csv}")
+    print(f"Total entries: {len(rows)}")
+
+###############################################################################
+# WORKER FUNCTION
+###############################################################################
+async def worker(worker_id, coords_subset, coverage_lock, coverage,
+                 rows, cols, all_coords, panolog_data, page, fig, ax):
+    """
+    Each worker processes its subset of coords using a single shared 'page' or each worker's page.
+    They call 'update_coverage_and_plot' with a lock to ensure the coverage array and plotting
+    is not done concurrently.
+    """
+    print(f"Worker {worker_id} started with {len(coords_subset)} coords.")
+    for (lat, lon) in coords_subset:
+        # If already valid, skip
         if panolog_data.get((lat, lon), {}).get("status") == "Valid":
-            grid[lat_idx, lon_idx] = 1
+            continue
 
-    plt.close("all")  # Ensure all previous figures are closed
-    plt.figure(figsize=(10, 10))
-    plt.imshow(grid, cmap="Greys", origin="upper")
-    plt.title("Grid Coverage Progress")
-    plt.xlabel("Longitude")
-    plt.ylabel("Latitude")
-    plt.colorbar(label="Coverage")
-    plt.grid(color="black", linewidth=0.5)
-    plt.pause(0.1)  # Allow real-time updates
+        pano_id, _ = await scrape_pano_id(page, lat, lon)
+        if pano_id:
+            panolog_data[(lat, lon)] = {"pano_id": pano_id, "status": "Valid"}
+            # Protected update + plot
+            await update_coverage_and_plot(
+                coverage_lock, coverage, rows, cols, all_coords,
+                lat, lon, fig, ax
+            )
+        else:
+            panolog_data[(lat, lon)] = {"pano_id": "", "status": "Invalid"}
+
+    print(f"Worker {worker_id} finished.")
 
 ###############################################################################
-# MAIN SCRIPT LOGIC
+# MAIN
 ###############################################################################
 async def main():
-    coords = generate_coordinates(LAT_MIN, LAT_MAX, LON_MIN, LON_MAX, IMAGE_AMT)
+    coords, rows, cols = generate_coordinates(LAT_MIN, LAT_MAX, LON_MIN, LON_MAX, IMAGE_AMT)
     total_points = len(coords)
+    print(f"Generated {total_points} points => {rows} rows x {cols} cols")
+
     panolog_data = load_panolog(PANOLOG)
 
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=False)
-        page = await browser.new_page()
+    coverage = init_coverage(rows, cols)
+    # Fill from existing log
+    for (lat, lon), info in panolog_data.items():
+        if info["status"] == "Valid" and (lat, lon) in coords:
+            update_coverage_in_array(coverage, rows, cols, coords, lat, lon)
 
-        for idx, (lat, lon) in enumerate(coords, 1):
-            print(f"\nScraping ({lat}, {lon}) ({idx}/{total_points})...")
-            if panolog_data.get((lat, lon), {}).get("status") == "Valid":
-                print("  -> Already scraped. Skipping.")
-                continue
+    # Start the coverage plot
+    fig, ax = plt.subplots(figsize=(10, 10))
+    draw_progress_grid(fig, ax, coverage)
 
-            pano_id, url = await scrape_pano_id(page, lat, lon)
-            if pano_id:
-                print(f"  -> Found Pano ID: {pano_id}")
-                panolog_data[(lat, lon)] = {"pano_id": pano_id, "status": "Valid"}
-            else:
-                print("  -> No Pano ID found.")
-                panolog_data[(lat, lon)] = {"pano_id": "", "status": "Invalid"}
+    # Split coords into subsets for N_WORKERS
+    subsets = split_coords_among_workers(coords, N_WORKERS)
 
-            draw_progress_grid(coords, panolog_data, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX)
-            save_panolog(PANOLOG, panolog_data)
+    # coverage_lock so only one draw at a time
+    coverage_lock = asyncio.Lock()
 
+    async with async_playwright() as pw:
+        # Launch one browser
+        browser = await pw.chromium.launch(headless=False)
+
+        # Create pages
+        pages = []
+        for w_id in range(N_WORKERS):
+            p = await browser.new_page()
+            pages.append(p)
+
+        # Make worker tasks
+        tasks = []
+        for w_id, subset in enumerate(subsets, start=1):
+            t = asyncio.create_task(worker(
+                worker_id=w_id,
+                coords_subset=subset,
+                coverage_lock=coverage_lock,
+                coverage=coverage,
+                rows=rows,
+                cols=cols,
+                all_coords=coords,
+                panolog_data=panolog_data,
+                page=pages[w_id-1],
+                fig=fig,
+                ax=ax
+            ))
+            tasks.append(t)
+
+        # Wait for concurrency
+        await asyncio.gather(*tasks)
         await browser.close()
 
-    print("\nAll scraping complete!")
+    # Final coverage update on screen
+    draw_progress_grid(fig, ax, coverage)
+    save_panolog(PANOLOG, panolog_data)
 
-###############################################################################
-# ENTRY POINT
-###############################################################################
+    print("\nScraping complete! Building final CSV...")
+    create_final_csv_from_panolog(panolog_data, FINAL_CSV)
+
+    # Keep the plot
+    plt.ioff()
+    plt.show()
+
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-
 
 
 
