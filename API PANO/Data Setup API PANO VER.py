@@ -23,7 +23,7 @@ LAT_MAX = 38.223611
 LON_MIN = -85.764151
 LON_MAX = -85.755796
 
-IMAGE_AMT = 1  # example: ~3 coords in each dimension => total ~9 points
+IMAGE_AMT = 4  # example: ~3 coords in each dimension => total ~9 points
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_DIR = os.path.join(SCRIPT_DIR, "Panoramas")
@@ -291,8 +291,8 @@ def download_and_stitch_pano(lat, lon, pano_id):
         # guessed tile layout at each zoom (this is empirical, might differ by location):
         # Zoom 5 might have max_x=26, max_y=13 for some panos.
         # For demonstration, let's guess 10x5. Feel free to refine.
-        max_x = 10
-        max_y = 5
+        max_x = 26
+        max_y = 13
         pano_img = stitch_pano(pano_id, zoom, max_x, max_y)
         if pano_img is not None:
             # Save result

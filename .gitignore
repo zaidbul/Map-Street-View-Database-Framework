@@ -11,6 +11,7 @@ Debug/
 # My ignores
 images/
 Panoramas/
+StitchedPanos/
 *.csv
 
 # Python
