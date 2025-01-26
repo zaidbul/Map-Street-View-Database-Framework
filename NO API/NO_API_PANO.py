@@ -26,7 +26,7 @@ LAT_MAX = 38.223611
 LON_MIN = -85.764151
 LON_MAX = -85.755796
 
-IMAGE_AMT = 30              # total approximate points in the grid
+IMAGE_AMT = 60              # total approximate points in the grid
 N_WORKERS = 8                # number of parallel scraping workers
 TIMEOUT = 5000
 RETRIES = 3
