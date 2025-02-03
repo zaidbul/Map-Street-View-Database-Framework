@@ -21,14 +21,14 @@ from pyproj import Transformer
 ###############################################################################
 # CONFIG / CONSTANTS
 ###############################################################################
-LAT_MIN = 38.210786
-LAT_MAX = 38.223611
-LON_MIN = -85.764151
-LON_MAX = -85.755796
+LAT_MAX = 38.220810
+LAT_MIN = 38.212298
+LON_MIN = -85.762930
+LON_MAX = -85.752885
 
-IMAGE_AMT = 60              # total approximate points in the grid
-N_WORKERS = 8                # number of parallel scraping workers
-TIMEOUT = 5000
+IMAGE_AMT = 7500             # total approximate points in the grid
+N_WORKERS = 20               # number of parallel scraping workers
+TIMEOUT = 15000
 RETRIES = 3
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -75,7 +75,7 @@ def get_pano_id_from_url(url):
 ###############################################################################
 # 2) ASYNC TILE DOWNLOAD + CV2 STITCH LOGIC (BATCHED)
 ###############################################################################
-CONCURRENT_REQUESTS = 10
+CONCURRENT_REQUESTS = 50
 semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
 # Global tracker for fallback attempts
@@ -343,12 +343,21 @@ def factor_rows_cols(total_points):
     return rows, cols
 
 def calculate_grid_dimensions(lat_min, lat_max, lon_min, lon_max, total_points):
-    """Calculate rows/cols based on actual geographic aspect ratio"""
+    """Calculate rows/cols based on actual geographic aspect ratio."""
     lat_range = lat_max - lat_min
     lon_range = lon_max - lon_min
+
+    # Validation for ranges
+    if lat_range <= 0 or lon_range <= 0:
+        raise ValueError(f"Invalid coordinate ranges: lat_range={lat_range}, lon_range={lon_range}")
+
     aspect_ratio = lon_range / lat_range
 
-    # Start with square-like grid
+    # Validate aspect ratio
+    if aspect_ratio <= 0 or np.isnan(aspect_ratio) or np.isinf(aspect_ratio):
+        raise ValueError(f"Invalid aspect ratio: {aspect_ratio}")
+
+    # Calculate base rows/cols
     base = int(np.sqrt(total_points / aspect_ratio))
     rows = int(base)
     cols = int(base * aspect_ratio)
@@ -360,6 +369,7 @@ def calculate_grid_dimensions(lat_min, lat_max, lon_min, lon_max, total_points):
             rows += 1
 
     return rows, cols
+
 
 def generate_coordinates(lat_min, lat_max, lon_min, lon_max, total_points):
     rows, cols = calculate_grid_dimensions(lat_min, lat_max, lon_min, lon_max, total_points)
@@ -726,7 +736,7 @@ async def main():
 
         # Launch worker browsers
         for w_id in range(N_WORKERS):
-            VIEW_TABS = True  # Set to True to see browsers
+            VIEW_TABS = False  # Set to True to see browsers
 
             if VIEW_TABS:
                 browser = await pw.chromium.launch(
